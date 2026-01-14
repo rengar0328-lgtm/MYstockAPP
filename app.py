@@ -6,37 +6,60 @@ import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import json
+import requests
 from datetime import datetime
 
 # ==========================================
 # 💎 網頁設定
 # ==========================================
 st.set_page_config(
-    page_title="V32.5 終極細節版",
+    page_title="V32.7 戰艦指揮中心",
     page_icon="💎",
     layout="wide"
 )
 
 # ==========================================
+# 🕸️ 爬蟲模組
+# ==========================================
+@st.cache_data(ttl=3600*12)
+def get_tw_tickers(selected_industries=None):
+    stock_list = []
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        # 上市
+        url_tw = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
+        res = requests.get(url_tw, headers=headers)
+        res.encoding = 'big5'
+        df = pd.read_html(res.text)[0].iloc[2:]
+        for index, row in df.iterrows():
+            code_name = str(row[0]).split()
+            if len(code_name) == 2:
+                code, industry = code_name[0], str(row[4])
+                if len(code) == 4 and (selected_industries is None or industry in selected_industries):
+                    stock_list.append(f"{code}.TW")
+
+        # 上櫃
+        url_two = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
+        res = requests.get(url_two, headers=headers)
+        res.encoding = 'big5'
+        df = pd.read_html(res.text)[0].iloc[2:]
+        for index, row in df.iterrows():
+            code_name = str(row[0]).split()
+            if len(code_name) == 2:
+                code, industry = code_name[0], str(row[4])
+                if len(code) == 4 and (selected_industries is None or industry in selected_industries):
+                    stock_list.append(f"{code}.TWO")
+                    
+        return list(set(stock_list))
+    except: return []
+
+# ==========================================
 # 🛠️ 核心運算
 # ==========================================
-def get_smart_data(ticker):
-    # 智慧偵測：上市(.TW) 或 上櫃(.TWO)
-    if ".TW" in ticker.upper() or ".TWO" in ticker.upper():
-        return yf.download(ticker, period="2y", interval="1d", auto_adjust=False, progress=False)
-    
-    try_tw = f"{ticker}.TW"
-    df = yf.download(try_tw, period="2y", interval="1d", auto_adjust=False, progress=False)
-    
-    if df.empty or len(df) < 5:
-        try_two = f"{ticker}.TWO"
-        df_two = yf.download(try_two, period="2y", interval="1d", auto_adjust=False, progress=False)
-        if not df_two.empty and len(df_two) > 5:
-            df_two.attrs['symbol'] = try_two
-            return df_two
-    
-    df.attrs['symbol'] = try_tw
-    return df
+def get_stock_data_batch(tickers):
+    try:
+        return yf.download(tickers, period="2y", interval="1d", group_by='ticker', auto_adjust=False, progress=False)
+    except: return None
 
 def calculate_slope(series, window=5):
     try:
@@ -59,218 +82,163 @@ def calculate_kd(high, low, close, n=9):
 
 def calculate_macd(close, fast=12, slow=26, signal=9):
     try:
-        exp1 = close.ewm(span=fast, adjust=False).mean()
-        exp2 = close.ewm(span=slow, adjust=False).mean()
-        macd = exp1 - exp2
-        signal_line = macd.ewm(span=signal, adjust=False).mean()
-        hist = macd - signal_line
+        hist = close.ewm(span=fast).mean() - close.ewm(span=slow).mean()
+        hist = hist - hist.ewm(span=signal).mean()
         return hist
     except: return pd.Series()
 
-def analyze_stock(df, user_input_id):
+def analyze_stock(df, ticker_id):
     try:
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        
+        if isinstance(df.columns, pd.MultiIndex): df.columns = [c[0] for c in df.columns]
         df = df.sort_index()
-        # 確保有足夠資料
-        if len(df) < 200: return None
+        if len(df) < 200 or df['Volume'].iloc[-1] < 300000: return None
         
-        # --- 指標運算 (全數據) ---
         df['MA5'] = df['Close'].rolling(5).mean()
-        df['MA10'] = df['Close'].rolling(10).mean() # 加入 MA10
+        df['MA10'] = df['Close'].rolling(10).mean()
         df['MA20'] = df['Close'].rolling(20).mean()
         df['MA60'] = df['Close'].rolling(60).mean()
-        
         df['K'], df['D'] = calculate_kd(df['High'], df['Low'], df['Close'])
         df['MACD_Hist'] = calculate_macd(df['Close'])
         
-        # 斜率
-        slope5 = calculate_slope(df['MA5'])
-        slope10 = calculate_slope(df['MA10'])
-        slope20 = calculate_slope(df['MA20'])
+        slope5, slope20 = calculate_slope(df['MA5']), calculate_slope(df['MA20'])
         
-        # 切割出最後 300 天 (給 AI 和畫圖用)
-        # 如果資料不足 300 天，就取全部
-        lookback = 300
-        if len(df) < 300: lookback = len(df)
-            
+        lookback = min(len(df), 300)
         df_300 = df.tail(lookback).copy()
-        
-        # 當前數據
         now = float(df_300['Close'].iloc[-1])
-        real_symbol = df.attrs.get('symbol', user_input_id)
         
-        # V32 評分
         score = 50
-        trend_status = "震盪"
-        special_tag = ""
-        
-        ma5_now = df_300['MA5'].iloc[-1]
-        ma10_now = df_300['MA10'].iloc[-1]
-        ma20_now = df_300['MA20'].iloc[-1]
-        
-        is_triple_bull = (ma5_now > ma10_now > ma20_now)
-        is_slope_pos = (slope5 > 0 and slope10 > 0 and slope20 > 0)
-        
-        if is_triple_bull: score += 20
-        if is_slope_pos: 
+        trend = "震盪"
+        if df_300['MA5'].iloc[-1] > df_300['MA10'].iloc[-1] > df_300['MA20'].iloc[-1]: score += 20
+        if slope5 > 0 and slope20 > 0: 
             score += 50
-            trend_status = "🔥🔥三線全紅"
-            special_tag = "🔥🔥三線全紅"
-        
+            trend = "🔥🔥三線全紅"
         if df_300['MACD_Hist'].iloc[-1] > 0: score += 10
         if df_300['K'].iloc[-1] > df_300['D'].iloc[-1]: score += 10
 
-        est_profit = max(slope20, slope5) * 10
-        
-        # 生成 AI 用的序列數據
-        date_seq = [d.strftime('%m-%d') for d in df_300.index]
-        price_seq = [round(x, 1) for x in df_300['Close'].tolist()]
-        vol_seq = [int(v/1000) for v in df_300['Volume'].tolist()]
-
         return {
-            "ID": real_symbol,
+            "ID": ticker_id,
             "Price": round(now, 2),
             "Score": score,
-            "Trend_Desc": trend_status,
-            "Special_Tag": special_tag,
+            "Trend_Desc": trend,
             "Technical": {
-                "MA20_Slope": round(slope20, 2),
-                "MA10_Slope": round(slope10, 2),
-                "MACD": "紅" if df_300['MACD_Hist'].iloc[-1] > 0 else "綠",
-                "KD": "金叉" if df_300['K'].iloc[-1] > df_300['D'].iloc[-1] else "死叉"
+                "Slope20": round(slope20, 2),
+                "MACD": "紅" if df_300['MACD_Hist'].iloc[-1] > 0 else "綠"
             },
             "Display_Info": { 
-                "代號": real_symbol,
-                "現價": round(now, 2),
-                "評分": score,
-                "趨勢": trend_status,
-                "MA10斜率": round(slope10, 2), # 表格顯示 MA10 斜率
-                "預估%": round(est_profit, 1)
+                "代號": ticker_id, "現價": round(now, 2), "評分": score, 
+                "趨勢": trend, "斜率": round(slope20, 2), "預估%": round(max(slope20, 0)*10, 1)
             },
             "History_Data": { 
                 "High_300D": round(df_300['High'].max(), 2),
                 "Low_300D": round(df_300['Low'].min(), 2),
-                "Date_Seq": date_seq,
-                "Price_Seq": price_seq,
-                "Vol_Seq": vol_seq
+                "Date_Seq": [d.strftime('%m-%d') for d in df_300.index],
+                "Price_Seq": [round(x, 1) for x in df_300['Close'].tolist()],
+                "Vol_Seq": [int(v/1000) for v in df_300['Volume'].tolist()]
             },
             "Chart_Data": df_300 
         }
-    except Exception as e:
-        return None
+    except: return None
 
 # ==========================================
-# 🖥️ 介面邏輯
+# 🖥️ 介面邏輯 (新增 AI 戰情室)
 # ==========================================
-st.title("💎 V32.5 終極細節版 (含 MA10)")
-st.caption("支援：四條均線 (5/10/20/60)、完整 K 線圖、MACD/KD、AI 檔案生成")
+st.sidebar.title("💎 V32.7 指揮中心")
 
-# 1. 輸入區
-default_input = "2330 2317 2603 3402 8059 4743"
-user_input = st.text_area("輸入股票代號 (純數字即可，空白分隔)", default_input, height=80)
+# --- 🤖 AI 傳送門 (新增功能) ---
+st.sidebar.markdown("---")
+st.sidebar.header("🤖 AI 戰情室")
+st.sidebar.info("點擊下方按鈕，直接開啟對話視窗")
+# 這裡使用 link_button 開啟新分頁，這是目前技術上最穩定的做法
+st.sidebar.link_button("🧠 開啟 Gemini (Google)", "https://gemini.google.com/app", type="primary", use_container_width=True)
+st.sidebar.link_button("🤖 開啟 ChatGPT", "https://chatgpt.com/", use_container_width=True)
+st.sidebar.markdown("---")
 
-if st.button("🚀 啟動掃描", type="primary"):
-    raw_tickers = list(set(user_input.split()))
-    st.write(f"📡 正在深度解析 {len(raw_tickers)} 檔股票...")
-    
-    results = []
-    progress_bar = st.progress(0)
-    
-    for i, t in enumerate(raw_tickers):
-        try:
-            stock_df = get_smart_data(t)
-            if not stock_df.empty:
-                res = analyze_stock(stock_df, t)
-                if res: results.append(res)
-        except: pass
-        progress_bar.progress((i + 1) / len(raw_tickers))
-        
-    if not results:
-        st.error("❌ 無數據，請檢查代號。")
-    else:
-        results.sort(key=lambda x: x['Score'], reverse=True)
-        
-        # ----------------------------------
-        # 📥 檔案生成區
-        # ----------------------------------
-        st.success(f"✅ 分析完成！共 {len(results)} 檔。")
-        
-        final_data = {
-            "Meta": {"Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"), "Logic": "V32.5_Full_Detail"},
-            "Stock_Data": [ {k: v for k, v in r.items() if k not in ['Display_Info', 'Chart_Data']} for r in results ]
-        }
-        json_str = json.dumps(final_data, ensure_ascii=False, indent=2)
-        
-        prompt_str = f"""
-你是一位擁有「全知視角」的避險基金操盤手。這是一份 V32.5 (細節版) 的深度數據包。
-數據包含 MA5, MA10, MA20, MA60 的完整趨勢判斷。
+# --- 模式選擇 ---
+mode = st.sidebar.radio("📡 掃描模式", ["手動輸入", "全市場掃描"])
 
-**【你的任務】**
-請利用這些數據進行深度判讀：
-1. **型態識別**：觀察 300 天走勢。
-2. **均線架構**：特別注意 MA10 (紫色線) 是否作為短線防守點。
-3. **選股建議**：推薦未來 10 天最強勢的標的。
-
-**【數據內容】**
-{json_str}
-        """
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button("📥 下載數據包 (.json)", json_str, "Stock_Data.json", "application/json", use_container_width=True)
-        with col2:
-            st.download_button("📥 下載指令包 (.txt)", prompt_str, "AI_Prompt.txt", "text/plain", use_container_width=True)
-
-        st.divider()
-
-        # ----------------------------------
-        # 📊 視覺化圖表區 (詳細歷史數據)
-        # ----------------------------------
-        st.subheader("📈 深度 K 線圖 (含 MA5/10/20/60)")
-        
-        # 讓用戶選擇股票
-        stock_options = [f"{r['ID']} ({r['Trend_Desc']})" for r in results]
-        selected_option = st.selectbox("請選擇要查看的股票:", stock_options)
-        
-        # 找出選到的股票資料
-        selected_id = selected_option.split(" ")[0]
-        target = next(item for item in results if item["ID"] == selected_id)
-        df_chart = target['Chart_Data']
-        
-        # --- 繪圖核心 (Plotly) ---
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, 
-                            vertical_spacing=0.03, 
-                            row_heights=[0.6, 0.2, 0.2],
-                            subplot_titles=(f"{selected_id} 價量趨勢", "成交量", "MACD"))
-
-        # 1. 主圖：K線 + 4條均線
-        fig.add_trace(go.Candlestick(x=df_chart.index,
-                                     open=df_chart['Open'], high=df_chart['High'],
-                                     low=df_chart['Low'], close=df_chart['Close'],
-                                     name='K線'), row=1, col=1)
-        
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA5'], line=dict(color='orange', width=1), name='MA5 (週線)'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA10'], line=dict(color='purple', width=1), name='MA10 (雙週線)'), row=1, col=1) # 新增 MA10
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA20'], line=dict(color='blue', width=1.5), name='MA20 (月線)'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart['MA60'], line=dict(color='green', width=1.5), name='MA60 (季線)'), row=1, col=1)
-        
-        # 2. 副圖：成交量
-        colors = ['red' if row['Open'] - row['Close'] >= 0 else 'green' for index, row in df_chart.iterrows()]
-        fig.add_trace(go.Bar(x=df_chart.index, y=df_chart['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
-
-        # 3. 副圖：MACD
-        fig.add_trace(go.Bar(x=df_chart.index, y=df_chart['MACD_Hist'], name='MACD柱狀'), row=3, col=1)
-        
-        fig.update_layout(height=800, xaxis_rangeslider_visible=False, showlegend=True)
-        
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # 顯示詳細數據表格 (含 MA10)
-        with st.expander(f"查看 {selected_id} 詳細歷史數據表格"):
-            # 這裡加入了 MA10
-            st.dataframe(df_chart[['Open', 'High', 'Low', 'Close', 'Volume', 'MA5', 'MA10', 'MA20', 'MA60', 'K', 'D']].sort_index(ascending=False))
-
+final_tickers = []
+if mode == "手動輸入":
+    user_input = st.sidebar.text_area("輸入代號", "2330 2317 2603 3402 8059", height=100)
+    if user_input:
+        raw = list(set(user_input.split()))
+        for t in raw:
+            if "." not in t:
+                final_tickers.append(f"{t}.TW")
+                final_tickers.append(f"{t}.TWO")
+            else: final_tickers.append(t)
 else:
-    st.info("👈 輸入代號並按下按鈕，查看包含 MA10 的完整趨勢圖。")
+    all_inds = ["半導體業", "電子零組件業", "電腦及週邊設備業", "通信網路業", "航運業", "生技醫療業"]
+    selected_inds = st.sidebar.multiselect("選擇產業", all_inds, default=["半導體業", "生技醫療業"])
+    if st.sidebar.button("📥 更新清單"):
+        with st.spinner("連線證交所中..."):
+            st.session_state['tickers'] = get_tw_tickers(selected_inds if selected_inds else None)
+    if 'tickers' in st.session_state:
+        final_tickers = st.session_state['tickers']
+        st.sidebar.write(f"已鎖定 {len(final_tickers)} 檔")
+
+# --- 主畫面 ---
+st.title("💎 V32.7 戰艦指揮中心")
+
+if st.button("🚀 啟動掃描運算", type="primary"):
+    if not final_tickers:
+        st.error("❌ 請先輸入或抓取股票代號")
+    else:
+        st.write(f"📡 掃描 {len(final_tickers)} 檔標的中...")
+        results = []
+        progress = st.progress(0)
+        batch_size = 50
+        
+        for i in range(0, len(final_tickers), batch_size):
+            batch = final_tickers[i:i+batch_size]
+            try:
+                data = get_stock_data_batch(batch)
+                if data is not None:
+                    for t in batch:
+                        try:
+                            df = data if len(batch)==1 else data[t]
+                            if isinstance(df, pd.DataFrame) and not df.empty:
+                                res = analyze_stock(df, t)
+                                if res: results.append(res)
+                        except: pass
+            except: pass
+            progress.progress(min((i+batch_size)/len(final_tickers), 1.0))
+            
+        if not results:
+            st.error("❌ 查無符合條件股票")
+        else:
+            results.sort(key=lambda x: x['Score'], reverse=True)
+            
+            # --- 檔案生成區 ---
+            st.success(f"✅ 掃描完成！共 {len(results)} 檔。")
+            
+            json_str = json.dumps({"Meta": "V32.7", "Data": [r['History_Data'] for r in results]}, ensure_ascii=False)
+            prompt_str = f"請分析以下 V32.7 數據 (含 300 天序列):\n{json_str}"
+            
+            # 這裡我們做一個「工作流區塊」
+            st.markdown("### 🛠️ AI 分析工作流")
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col1:
+                st.download_button("1️⃣ 下載數據 (.json)", json_str, "data.json", "application/json", use_container_width=True)
+            with col2:
+                st.download_button("2️⃣ 下載指令 (.txt)", prompt_str, "prompt.txt", "text/plain", use_container_width=True)
+            with col3:
+                # 在下載按鈕旁邊直接放 Gemini 連結，方便順手點擊
+                st.link_button("3️⃣ 前往 Gemini 分析 ➤", "https://gemini.google.com/app", type="primary", use_container_width=True)
+            
+            st.divider()
+            
+            # --- 圖表區 ---
+            st.subheader("📈 K 線診斷室")
+            df_show = pd.DataFrame([r['Display_Info'] for r in results])
+            st.dataframe(df_show, use_container_width=True)
+            
+            opt = st.selectbox("選擇股票:", [r['ID'] for r in results])
+            tgt = next(r for r in results if r['ID'] == opt)
+            df = tgt['Chart_Data']
+            
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='blue'), name='MA20'), row=1, col=1)
+            fig.add_trace(go.Bar(x=df.index, y=df['Volume'], name='Vol'), row=2, col=1)
+            fig.update_layout(height=600, xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig, use_container_width=True)
