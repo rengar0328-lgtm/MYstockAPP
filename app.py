@@ -13,49 +13,75 @@ from datetime import datetime
 # 💎 網頁設定
 # ==========================================
 st.set_page_config(
-    page_title="V32.8 自動導航版",
+    page_title="V32.9 絕對防禦版",
     page_icon="💎",
     layout="wide"
 )
 
 # ==========================================
-# 🕸️ 爬蟲模組 (自動抓取清單)
+# 🛡️ 離線資料庫 (Fallback) - 保證有股可掃
+# ==========================================
+OFFLINE_LIST = [
+    # 半導體
+    "2330.TW", "2454.TW", "2303.TW", "2379.TW", "3443.TW", "3661.TW", "3035.TW", "3034.TW", "3529.TWO", "3293.TWO",
+    "8059.TWO", "8299.TWO", "6147.TWO", "6223.TWO", "3105.TWO", "4966.TW", "6415.TW", "6531.TW", "5269.TW",
+    # 航運
+    "2603.TW", "2609.TW", "2615.TW", "2618.TW", "2610.TW", "2637.TW", "2605.TW", "2606.TW", "5608.TW",
+    # 生技
+    "4743.TWO", "4128.TWO", "6461.TWO", "6550.TWO", "4114.TWO", "4162.TWO", "6446.TWO", "6589.TWO", "1795.TW",
+    # 電腦與AI
+    "2317.TW", "2382.TW", "3231.TW", "2356.TW", "2353.TW", "6669.TW", "3402.TW", "2376.TW", "2377.TW", "3017.TW",
+    "2301.TW", "2324.TW", "2449.TW", "3044.TW", "3706.TW", "8150.TW", "3533.TW", "6213.TW", "3583.TW", "5227.TWO"
+]
+
+# ==========================================
+# 🕸️ 爬蟲模組 (含自動切換機制)
 # ==========================================
 @st.cache_data(ttl=3600*12)
 def get_tw_tickers_auto(industries=None):
-    # 如果使用者沒選產業，預設抓取這些熱門族群
+    # 預設產業
     if not industries:
-        industries = ["半導體業", "電腦及週邊設備業", "通信網路業", "電子零組件業", "航運業", "生技醫療業"]
+        industries = ["半導體業", "電腦及週邊設備業", "通信網路業", "航運業", "生技醫療業"]
     
     stock_list = []
     try:
+        # 嘗試連線證交所
         headers = {'User-Agent': 'Mozilla/5.0'}
+        
         # 1. 上市
-        url_tw = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"
-        res = requests.get(url_tw, headers=headers)
-        res.encoding = 'big5'
-        df = pd.read_html(res.text)[0].iloc[2:]
-        for index, row in df.iterrows():
-            code_name = str(row[0]).split()
-            if len(code_name) == 2:
-                code, ind = code_name[0], str(row[4])
-                if len(code) == 4 and ind in industries:
-                    stock_list.append(f"{code}.TW")
+        res = requests.get("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", headers=headers, timeout=5)
+        # 用 pandas 解析
+        try:
+            df = pd.read_html(res.text)[0].iloc[2:]
+            for index, row in df.iterrows():
+                code_name = str(row[0]).split()
+                if len(code_name) == 2:
+                    code, ind = code_name[0], str(row[4])
+                    if len(code) == 4 and ind in industries:
+                        stock_list.append(f"{code}.TW")
+        except: pass
 
         # 2. 上櫃
-        url_two = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
-        res = requests.get(url_two, headers=headers)
-        res.encoding = 'big5'
-        df = pd.read_html(res.text)[0].iloc[2:]
-        for index, row in df.iterrows():
-            code_name = str(row[0]).split()
-            if len(code_name) == 2:
-                code, ind = code_name[0], str(row[4])
-                if len(code) == 4 and ind in industries:
-                    stock_list.append(f"{code}.TWO")
-                    
+        res = requests.get("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", headers=headers, timeout=5)
+        try:
+            df = pd.read_html(res.text)[0].iloc[2:]
+            for index, row in df.iterrows():
+                code_name = str(row[0]).split()
+                if len(code_name) == 2:
+                    code, ind = code_name[0], str(row[4])
+                    if len(code) == 4 and ind in industries:
+                        stock_list.append(f"{code}.TWO")
+        except: pass
+
+        # 如果爬蟲抓不到東西，就用離線清單
+        if not stock_list:
+            return OFFLINE_LIST
+            
         return list(set(stock_list))
-    except: return []
+    
+    except Exception as e:
+        # 如果連線失敗 (例如公司防火牆擋住)，直接回傳離線清單
+        return OFFLINE_LIST
 
 # ==========================================
 # 🛠️ 核心運算
@@ -95,8 +121,7 @@ def analyze_stock(df, ticker_id):
     try:
         if isinstance(df.columns, pd.MultiIndex): df.columns = [c[0] for c in df.columns]
         df = df.sort_index()
-        # 基本濾網
-        if len(df) < 200 or df['Volume'].iloc[-1] < 300000: return None
+        if len(df) < 200 or df['Volume'].iloc[-1] < 100000: return None # 放寬濾網到100張
         
         df['MA5'] = df['Close'].rolling(5).mean()
         df['MA10'] = df['Close'].rolling(10).mean()
@@ -113,8 +138,6 @@ def analyze_stock(df, ticker_id):
         
         score = 50
         trend = "震盪"
-        
-        # V32 評分邏輯
         if df_300['MA5'].iloc[-1] > df_300['MA10'].iloc[-1] > df_300['MA20'].iloc[-1]: score += 20
         if slope5 > 0 and slope20 > 0: 
             score += 50
@@ -147,23 +170,21 @@ def analyze_stock(df, ticker_id):
     except: return None
 
 # ==========================================
-# 🖥️ 介面邏輯 (自動導航版)
+# 🖥️ 介面邏輯 (AI 戰情室 + 自動導航)
 # ==========================================
-st.sidebar.title("💎 V32.8 自動導航")
+st.sidebar.title("💎 V32.9 絕對防禦版")
 st.sidebar.markdown("---")
-# AI 按鈕
-st.sidebar.link_button("🧠 開啟 Gemini (Google)", "https://gemini.google.com/app", type="primary", use_container_width=True)
+st.sidebar.link_button("🧠 開啟 Gemini", "https://gemini.google.com/app", type="primary", use_container_width=True)
 st.sidebar.link_button("🤖 開啟 ChatGPT", "https://chatgpt.com/", use_container_width=True)
 st.sidebar.markdown("---")
 
-# 模式切換
 mode = st.sidebar.radio("📡 選擇掃描對象", ["手動輸入代號", "全市場/產業掃描"])
 
 target_tickers = []
 selected_inds = []
 
 if mode == "手動輸入代號":
-    st.sidebar.caption("適合快速查詢特定股票")
+    st.sidebar.caption("快速查詢特定股票")
     user_input = st.sidebar.text_area("輸入代號", "2330 2317 2603", height=100)
     if user_input:
         raw = list(set(user_input.split()))
@@ -173,33 +194,35 @@ if mode == "手動輸入代號":
                 target_tickers.append(f"{t}.TWO")
             else: target_tickers.append(t)
             
-else: # 全市場掃描
+else: # 全市場
     st.sidebar.caption("自動抓取符合產業的股票")
-    all_inds = ["半導體業", "電子零組件業", "電腦及週邊設備業", "通信網路業", "航運業", "生技醫療業", "光電業", "汽車工業"]
-    selected_inds = st.sidebar.multiselect("選擇產業 (預設掃描重點族群)", all_inds, default=["半導體業", "航運業", "生技醫療業"])
-    st.sidebar.info("💡 按下主畫面「啟動掃描」後，系統會自動抓取最新清單，您無需輸入任何代號。")
+    all_inds = ["半導體業", "電子零組件業", "電腦及週邊設備業", "通信網路業", "航運業", "生技醫療業"]
+    selected_inds = st.sidebar.multiselect("選擇產業", all_inds, default=["半導體業", "航運業", "生技醫療業"])
+    st.sidebar.info("💡 系統內建「離線資料庫」，若無法連線證交所，將自動掃描熱門 100 檔。")
 
 # --- 主畫面 ---
-st.title("💎 V32.8 戰艦自動導航版")
+st.title("💎 V32.9 戰艦絕對防禦版")
 
 if st.button("🚀 啟動掃描運算", type="primary"):
     
-    # [關鍵修改] 自動化邏輯：如果是全市場模式，且沒有代號，就自動去抓
+    # 自動抓取邏輯 (含Fallback)
     if mode == "全市場/產業掃描":
-        with st.spinner("📡 正在連線證交所，自動抓取全市場清單..."):
+        with st.spinner("📡 正在獲取清單 (連線失敗將自動切換離線模式)..."):
             target_tickers = get_tw_tickers_auto(selected_inds)
+            if target_tickers == OFFLINE_LIST:
+                st.toast("⚠️ 網路/爬蟲異常，已切換至「離線熱門股清單」進行掃描。", icon="🛡️")
+            else:
+                st.toast(f"✅ 成功抓取全市場清單，共 {len(target_tickers)} 檔。", icon="📡")
     
-    # 檢查
     if not target_tickers:
-        st.error("❌ 錯誤：沒有代號。請檢查手動輸入欄位。")
+        st.error("❌ 嚴重錯誤：無法獲取任何股票代號。")
     else:
-        st.write(f"📡 鎖定 {len(target_tickers)} 檔標的，開始全速運算...")
+        st.write(f"📡 鎖定 {len(target_tickers)} 檔標的，全速運算中...")
         
         results = []
         progress = st.progress(0)
         batch_size = 50
         
-        # 批次運算
         for i in range(0, len(target_tickers), batch_size):
             batch = target_tickers[i:i+batch_size]
             try:
@@ -216,15 +239,14 @@ if st.button("🚀 啟動掃描運算", type="primary"):
             progress.progress(min((i+batch_size)/len(target_tickers), 1.0))
             
         if not results:
-            st.warning("⚠️ 掃描完成，但沒有符合條件的股票 (可能是成交量太低)。")
+            st.warning("⚠️ 掃描完成，但沒有符合條件的股票。")
         else:
             results.sort(key=lambda x: x['Score'], reverse=True)
             
-            # --- 檔案生成 ---
             st.success(f"✅ 掃描完成！共發現 {len(results)} 檔強勢股。")
             
-            json_str = json.dumps({"Meta": "V32.8", "Data": [r['History_Data'] for r in results]}, ensure_ascii=False)
-            prompt_str = f"請分析以下 V32.8 數據:\n{json_str}"
+            json_str = json.dumps({"Meta": "V32.9", "Data": [r['History_Data'] for r in results]}, ensure_ascii=False)
+            prompt_str = f"請分析以下 V32.9 數據:\n{json_str}"
             
             st.markdown("### 🛠️ AI 分析工作流")
             c1, c2, c3 = st.columns(3)
@@ -234,12 +256,11 @@ if st.button("🚀 啟動掃描運算", type="primary"):
             
             st.divider()
             
-            # --- 圖表與表格 ---
             st.subheader("📈 K 線診斷室")
             df_show = pd.DataFrame([r['Display_Info'] for r in results])
             st.dataframe(df_show, use_container_width=True)
             
-            opt = st.selectbox("選擇股票查看詳情:", [r['ID'] for r in results])
+            opt = st.selectbox("選擇股票:", [r['ID'] for r in results])
             tgt = next(r for r in results if r['ID'] == opt)
             df = tgt['Chart_Data']
             
